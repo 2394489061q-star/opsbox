@@ -1,5 +1,7 @@
 # opsbox
 
+[![CI](https://github.com/2394489061q-star/opsbox/actions/workflows/ci.yml/badge.svg)](https://github.com/2394489061q-star/opsbox/actions/workflows/ci.yml)
+
 **Linux 服务器巡检与故障排查工具箱。** 一条命令给出结构化的健康报告，把「登录上去一条条敲命令」变成「看一份带处置建议的清单」。
 
 纯 Bash，零第三方依赖，不需要 root，不需要联网，不需要装 Python。`scp` 到任意一台 Linux 上就能跑。
