@@ -96,11 +96,16 @@ jobs:
       # 夹具测试证明的是「逻辑对不对」；这一条证明「在真实 /proc 上跑得起来」。
       - name: 真实 /proc 冒烟测试（json / md / prom）
         run: |
+          # GitHub Actions 默认以 `bash -e` 执行本段。opsbox 在真实机器上返回
+          # 1(WARN)/2(CRIT) 属于正常结果，而 `-e` 会在此当场终止脚本，下面的
+          # 判断根本执行不到（CI 首次运行就踩了这个坑：冒烟测试莫名失败）。
+          # 因此这里显式关掉 -e，并用 `|| code=$?` 明确捕获退出码。
+          set +e
           set -uo pipefail
           rc=0
           for fmt in json md prom; do
-            bash opsbox check -f "$fmt" >"smoke-$fmt.out" 2>"smoke-$fmt.err"
-            code=$?
+            code=0
+            bash opsbox check -f "$fmt" >"smoke-$fmt.out" 2>"smoke-$fmt.err" || code=$?
             # 真实机器上出现 WARN/CRIT 是正常的：0=通过 1=WARN 2=CRIT 都接受；
             # 3=用法错误、4=采集失败 才说明工具本身有问题。
             if [ "$code" -le 2 ]; then

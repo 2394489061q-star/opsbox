@@ -90,7 +90,7 @@ opsbox 把这三件事变成一次执行：**采集 → 判定 → 出报告**�
 
 ```bash
 # 方式一：直接跑，不需要安装
-git clone https://github.com/<your-name>/opsbox.git
+git clone https://github.com/2394489061q-star/opsbox.git
 cd opsbox
 chmod +x opsbox
 sudo ./opsbox              # 需要读 /etc/shadow 的检查项要求 root，其他项普通用户即可
