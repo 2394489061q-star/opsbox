@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# opsbox —— Linux 服务器巡检与故障排查工具箱
+#
+# 单文件入口：零第三方依赖、纯 Bash，可 scp 到任意服务器直接运行。
+#
+# 退出码（对外契约，可直接接监控/CI/cron）：
+#   0 = 全部通过    1 = 存在 WARN    2 = 存在 CRIT
+#   3 = 用法错误    4 = 采集失败
+# ==============================================================================
+
+set -u
+set -o pipefail
+
+# ---------------------------------------------------------------- 定位自身 ----
+ob_resolve_self_dir() {
+    local src="${BASH_SOURCE[0]}" dir
+    while [ -L "$src" ]; do
+        dir="$(cd -P "$(dirname "$src")" && pwd)"
+        src="$(readlink "$src")"
+        case "$src" in
+            /*) ;;
+            *) src="$dir/$src" ;;
+        esac
+    done
+    cd -P "$(dirname "$src")" && pwd
+}
+
+OB_ROOT_DIR="$(ob_resolve_self_dir)"
+OB_LIB_DIR="$OB_ROOT_DIR/lib"
+OB_MODULE_DIR="$OB_ROOT_DIR/modules"
+
+# ---------------------------------------------------------------- 加载核心 ----
+# shellcheck source=lib/core.sh
+. "$OB_LIB_DIR/core.sh" || { printf 'opsbox: 无法加载 lib/core.sh\n' >&2; exit 4; }
+# shellcheck source=lib/collect.sh
+. "$OB_LIB_DIR/collect.sh" || { printf 'opsbox: 无法加载 lib/collect.sh\n' >&2; exit 4; }
+# shellcheck source=lib/checks.sh
+. "$OB_LIB_DIR/checks.sh" || { printf 'opsbox: 无法加载 lib/checks.sh\n' >&2; exit 4; }
+# shellcheck source=lib/report.sh
+. "$OB_LIB_DIR/report.sh" || { printf 'opsbox: 无法加载 lib/report.sh\n' >&2; exit 4; }
+
+ob_load_modules() {
+    local f
+    for f in "$OB_MODULE_DIR"/*.sh; do
+        [ -r "$f" ] || continue
+        # shellcheck disable=SC1090
+        . "$f" || ob_die "无法加载模块：$f" "$OB_EXIT_UNKNOWN"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------- 帮助 ----
+ob_usage() {
+    cat <<'USAGE'
+opsbox —— Linux 服务器巡检与故障排查工具箱
+
+用法：
+  opsbox [命令] [选项]
+
+命令：
+  check              执行巡检（默认命令）
+  list               列出本次采集到的所有检查项，便于精确静音
+  modules            列出可用模块
+  version            显示版本
+  help               显示本帮助
+
+选项：
+  -f, --format FMT   输出格式：text（默认）md json prom csv oneline
+                     别名：markdown = md，prometheus = prom
+  -o, --output FILE  把报告写入文件（默认输出到标准输出）
+  -m, --modules LIST 只运行指定模块，逗号分隔，顺序不限
+                     可用：system,cpu,memory,disk,network,service,log,security
+                     注意：实际执行顺序是固定的（见下），与书写顺序无关
+  -c, --conf FILE    额外加载一个配置文件（最后加载，优先级最高）
+  -i, --interval SEC 采样间隔秒数，用于 CPU 使用率与磁盘 IO 延迟（默认 1，0 表示不等待）
+      --fail-on LVL  达到哪个级别才返回非零退出码：ok|warn|crit|never（默认 warn）
+                     UNKNOWN 不参与 warn/crit 判定 —— 采集不到数据不会让巡检失败，
+                     只有 --fail-on ok 才会把 UNKNOWN 视为失败
+      --no-color     关闭彩色输出
+      --color        强制开启彩色输出
+  -q, --quiet        只输出报告，抑制提示信息
+  -d, --debug        输出调试日志
+  -h, --help         显示帮助
+  -V, --version      显示版本
+
+示例：
+  opsbox                                   # 全量巡检，终端报告
+  opsbox check -f json -o /var/log/opsbox.json
+  opsbox check -m disk,memory --fail-on crit   # 只看磁盘内存，仅严重时非零退出
+  opsbox check -f prom -o /var/lib/node_exporter/textfile/opsbox.prom
+  opsbox list                              # 看看有哪些检查项可以静音
+
+退出码：0=通过 1=警告 2=严重 3=用法错误 4=采集失败
+
+配置优先级（后者覆盖前者）：
+  内置默认值 → <安装目录>/conf/opsbox.conf → /etc/opsbox/opsbox.conf
+  → ~/.config/opsbox/opsbox.conf → --conf 指定的文件
+  即：随项目分发的默认值优先级最低，运维在 /etc 的调优不会被它覆盖。
+
+模块执行顺序固定为（与 -m 中给出的顺序无关）：
+  system → cpu → memory → disk → network → service → log → security
+  固定顺序是为了让不同机器、不同时间的报告可以直接逐行对比。
+USAGE
+}
+
+# ---------------------------------------------------------------- 参数解析 ----
+OB_FORMAT="text"
+OB_OUTPUT=""
+OB_MODULES_ARG=""
+OB_CONF_ARG=""
+OB_FAIL_ON="warn"
+OB_COMMAND="check"
+
+ob_parse_args() {
+    if [ "$#" -eq 0 ]; then
+        OB_COMMAND="check"
+        return 0
+    fi
+
+    case "$1" in
+        check|list|modules|version|help) OB_COMMAND="$1"; shift ;;
+        -h|--help) OB_COMMAND="help"; return 0 ;;
+        -V|--version) OB_COMMAND="version"; return 0 ;;
+        -*) OB_COMMAND="check" ;;
+        *) ob_die "未知命令：$1（可用：check list modules version help）" "$OB_EXIT_USAGE" ;;
+    esac
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -f|--format)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OB_FORMAT="$2"; shift 2 ;;
+            -o|--output)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OB_OUTPUT="$2"; shift 2 ;;
+            -m|--modules)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OB_MODULES_ARG="$2"; shift 2 ;;
+            -c|--conf)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OB_CONF_ARG="$2"; shift 2 ;;
+            -i|--interval)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OPSBOX_SAMPLE_INTERVAL="$2"; shift 2 ;;
+            --fail-on)
+                [ "$#" -ge 2 ] || ob_die "选项 $1 缺少参数" "$OB_EXIT_USAGE"
+                OB_FAIL_ON="$2"; shift 2 ;;
+            --no-color)  OB_COLOR_MODE="never"; shift ;;
+            --color)     OB_COLOR_MODE="always"; shift ;;
+            -q|--quiet)  OB_QUIET=1; shift ;;
+            -d|--debug)  OB_DEBUG=1; shift ;;
+            -h|--help)   OB_COMMAND="help"; return 0 ;;
+            -V|--version) OB_COMMAND="version"; return 0 ;;
+            *) ob_die "未知选项：$1（用 opsbox help 查看帮助）" "$OB_EXIT_USAGE" ;;
+        esac
+    done
+
+    case "$OB_FORMAT" in
+        text|md|markdown|json|prom|prometheus|csv|oneline) ;;
+        *) ob_die "不支持的输出格式：$OB_FORMAT（可用：$(ob_render_supported_formats)）" "$OB_EXIT_USAGE" ;;
+    esac
+
+    case "$OB_FAIL_ON" in
+        ok|warn|crit|never) ;;
+        *) ob_die "--fail-on 取值无效：$OB_FAIL_ON（可用：ok warn crit never）" "$OB_EXIT_USAGE" ;;
+    esac
+
+    return 0
+}
+
+# ---------------------------------------------------------------- 模块选择 ----
+# 模块的执行顺序由 MODULE_ORDER 固定，而不是由用户书写顺序决定。
+# 这样 `-m disk,cpu` 与 `-m cpu,disk`、以及不同机器上的报告，
+# 检查项排列顺序完全一致，可以直接 diff 对比历史报告。
+OB_MODULE_ORDER="system cpu memory disk network service log security"
+
+ob_select_modules() {
+    local wanted="$OB_CFG_ENABLED_MODULES"
+
+    if [ -n "$OB_MODULES_ARG" ]; then
+        wanted="$(printf '%s' "$OB_MODULES_ARG" | tr ',' ' ')"
+    fi
+    # 规范化空白，方便下面用 " $m " 做整词匹配
+    wanted="$(ob_trim "$(printf '%s' "$wanted" | tr -s ' ')")"
+
+    local m
+    for m in $wanted; do
+        [ -n "$m" ] || continue
+        if [ "$(type -t "ob_module_$m" 2>/dev/null || true)" != "function" ]; then
+            ob_die "未知模块：$m（用 opsbox modules 查看可用模块）" "$OB_EXIT_USAGE"
+        fi
+    done
+
+    local selected="" found=0
+    for m in $OB_MODULE_ORDER; do
+        case " $wanted " in
+            *" $m "*) selected="$selected $m"; found=1 ;;
+        esac
+    done
+
+    [ "$found" -eq 1 ] || ob_die "没有任何模块被选中" "$OB_EXIT_USAGE"
+    OB_SELECTED_MODULES="$(ob_trim "$selected")"
+    return 0
+}
+
+# ---------------------------------------------------------------- 退出码 ----
+ob_should_fail() { # <worst_status>
+    local worst="$1"
+    case "$OB_FAIL_ON" in
+        never) return 1 ;;
+        ok)    [ "$worst" = "OK" ] && return 1
+               return 0 ;;
+        warn)  case "$worst" in WARN|CRIT) return 0 ;; *) return 1 ;; esac ;;
+        crit)  [ "$worst" = "CRIT" ] && return 0 || return 1 ;;
+        *)     return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------- 主流程 ----
+ob_main() {
+    ob_parse_args "$@"
+
+    ob_conf_defaults
+    ob_init_colors
+
+    case "$OB_COMMAND" in
+        help)    ob_usage; exit "$OB_EXIT_OK" ;;
+        version) printf '%s %s\n' "$OB_PROG" "$OB_VERSION"; exit "$OB_EXIT_OK" ;;
+    esac
+
+    # ------------------------------------------------------------ 配置分层 ----
+    # 顺序即优先级，后者覆盖前者。随项目分发的 conf/opsbox.conf 只提供默认值，
+    # 必须排在 /etc 之前——否则运维写在 /etc 里的调优会被默认值压回去，
+    # 而 conf 模板里恰好写着「建议把覆盖项写进 /etc/opsbox/opsbox.conf」。
+    local -a conf_files
+    conf_files=()
+    [ -r "$OB_ROOT_DIR/conf/opsbox.conf" ] && conf_files+=("$OB_ROOT_DIR/conf/opsbox.conf")
+    [ -r "/etc/opsbox/opsbox.conf" ] && conf_files+=("/etc/opsbox/opsbox.conf")
+    [ -r "${HOME:-/root}/.config/opsbox/opsbox.conf" ] && conf_files+=("${HOME:-/root}/.config/opsbox/opsbox.conf")
+    [ -n "$OB_CONF_ARG" ] && conf_files+=("$OB_CONF_ARG")
+    if [ "${#conf_files[@]}" -gt 0 ]; then
+        ob_load_conf "${conf_files[@]}"
+    fi
+
+    # 命令行传入的采样间隔优先级最高
+    if [ -n "${OPSBOX_SAMPLE_INTERVAL:-}" ]; then
+        OB_CFG_SAMPLE_INTERVAL="$OPSBOX_SAMPLE_INTERVAL"
+    fi
+
+    ob_load_modules
+
+    if [ "$OB_COMMAND" = "modules" ]; then
+        ob_list_modules
+        exit "$OB_EXIT_OK"
+    fi
+
+    ob_select_modules
+
+    case "$OB_COMMAND" in
+        list) OB_FORMAT="csv" ;;
+    esac
+
+    # 输出重定向
+    if [ -n "$OB_OUTPUT" ]; then
+        local outdir
+        outdir="$(dirname "$OB_OUTPUT")"
+        if [ ! -d "$outdir" ]; then
+            ob_die "输出目录不存在：$outdir" "$OB_EXIT_USAGE"
+        fi
+        if ! exec >"$OB_OUTPUT"; then
+            ob_die "无法写入输出文件：$OB_OUTPUT" "$OB_EXIT_USAGE"
+        fi
+    fi
+
+    export LC_ALL="${LC_ALL:-}"
+    OB_START_EPOCH="$(ob_now_epoch)"
+    local start_seconds="$SECONDS"
+
+    ob_detect_env
+    ob_info "开始巡检：${OB_ENV_HOSTNAME} (${OB_ENV_OS_PRETTY})"
+
+    local m
+    for m in $OB_SELECTED_MODULES; do
+        ob_debug "运行模块：$m"
+        "ob_module_$m"
+    done
+
+    OB_DURATION="$((SECONDS - start_seconds))"
+    if [ "$OB_RUN_MODE" = "" ]; then
+        OB_RUN_MODE="$OB_COMMAND"
+    fi
+    OB_RUN_MODE="$OB_COMMAND"
+
+    if [ "$OB_COMMAND" = "list" ]; then
+        ob_render_list
+    else
+        if ! ob_render "$OB_FORMAT"; then
+            ob_die "渲染失败：不支持的格式 $OB_FORMAT" "$OB_EXIT_USAGE"
+        fi
+    fi
+
+    local worst
+    worst="$(ob_worst_status)"
+    ob_info "巡检完成：${worst}（OK=${OB_N_OK} WARN=${OB_N_WARN} CRIT=${OB_N_CRIT} UNKNOWN=${OB_N_UNKNOWN}）"
+
+    if ob_should_fail "$worst"; then
+        exit "$(ob_exit_code_for_status "$worst")"
+    fi
+    exit "$OB_EXIT_OK"
+}
+
+ob_list_modules() {
+    printf '可用模块（在配置中用 OB_CFG_ENABLED_MODULES 指定，或命令行 -m 指定）：\n\n'
+    local m
+    for m in system cpu memory disk network service log security; do
+        printf '  %-10s %s\n' "$m" "$(ob_module_label "$m")"
+    done
+    printf '\n注意：模块执行顺序固定，与 -m 中给出的顺序无关，\n'
+    printf '      这是为了让不同机器、不同时间的报告可以直接对比。\n'
+    return 0
+}
+
+# list 命令：只关心「有哪些检查项、当前什么状态」，因此输出精简表格
+ob_render_list() {
+    local line
+    printf '%-9s %-28s %-34s %s\n' "状态" "检查项 ID" "说明" "观测值 / 阈值"
+    printf '%-9s %-28s %-34s %s\n' "--------" "--------------------------" "--------------------------------" "----------------"
+    if ob_have_results; then
+        for line in "${OB_RESULTS[@]}"; do
+            ob_result_split "$line"
+            printf '%-9s %-28s %-34s %s | %s\n' \
+                "$OB_F1" "$OB_F3" "$OB_F4" "$OB_F5" "$OB_F6"
+        done
+    fi
+    printf '\n静音某个检查项：在 opsbox.conf 中设置 OB_CFG_DISABLE_CHECKS="disk.inode.root,net.conntrack"\n'
+    return 0
+}
+
+ob_main "$@"

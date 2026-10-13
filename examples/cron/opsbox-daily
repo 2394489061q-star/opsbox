@@ -1,0 +1,43 @@
+# ==============================================================================
+# opsbox :: examples/cron/opsbox-daily
+#
+# 用途：直接放进 /etc/cron.d/ 的巡检任务——每天 06:17 跑一次全量巡检，
+#       把 Markdown 报告落到 /var/log/opsbox/report-YYYYMMDD.md，
+#       并把 opsbox 的摘要行（走 stderr 的 INFO 输出）追加进 /var/log/opsbox/cron.log。
+#
+# 安装方式（二选一）：
+#   install -m 0644 -o root -g root examples/cron/opsbox-daily /etc/cron.d/opsbox-daily
+#   packaging/install.sh --with-cron     # 会按 --bin-dir/--report-dir 自动改写下面的路径
+#
+# ---------------------------------------------------------- /etc/cron.d 的坑 ----
+# 1) 格式是「分 时 日 月 周 用户 命令」，比 crontab 多一个「用户」字段。
+#    少了它，cron 会把用户名当成命令来执行，任务永远不会按预期跑。
+# 2) 文件必须以换行结尾。最后一行没有换行符时，部分 cron 实现会整行忽略，
+#    表现为「装好了、权限也对、就是不跑」。
+# 3) 命令里的 % 必须写成 \%。cron 把未转义的 % 解释成「换行 + 后面内容作为命令的标准输入」，
+#    于是 `date +%Y%m%d` 会把整条命令从 % 处截断。下面写作 \%.
+# 4) 文件名只能包含 [A-Za-z0-9_-]，且不能出现点号，否则 run-parts 会跳过它。
+# 5) cron 的默认 PATH 极简（通常只有 /bin:/usr/bin），而 opsbox 依赖
+#    awk/sed/grep/df/systemctl/journalctl 等；下面显式设置 PATH 与 SHELL，
+#    避免「手跑正常、cron 里全是 UNKNOWN」。
+# 6) /etc/cron.d 下的文件必须是 root:root 且对组/其他不可写，否则 cron 静默拒绝加载。
+# ==============================================================================
+
+SHELL=/bin/sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=root
+# opsbox-managed: 本文件由 opsbox 项目提供，packaging/install.sh --with-cron 负责安装与回收
+
+# 分  时  日  月  周  用户  命令
+#
+# 为什么是 06:17 而不是整点：整点是备份、日志轮转、证书续期的拥堵时段，
+# 错开能减少与它们抢 IO 导致的误报（磁盘 IO 延迟、iowait 这两项最容易受影响）。
+# 报告里的日志窗口是「1 hour ago」（OB_CFG_LOG_SINCE），06:17 正好覆盖夜间批处理。
+#
+# 为什么必须先 mkdir -p：cron 不会替你创建报告目录，而 opsbox 的 -o 在目标目录
+# 不存在时会以退出码 3（用法错误）结束，报告一个字都不会留下。
+#
+# 为什么不加 `|| true`：cron 保留命令的退出码，WARN/CRIT 时退出码为 1/2，
+# cron 会按 MAILTO 发一封邮件提醒（输出已重定向到文件，邮件是「失败」信号）；
+# 想让 cron 完全不发信，就在命令末尾加 `|| true`——但那样 WARN/CRIT 也就静默了。
+17 6 * * * root mkdir -p /var/log/opsbox && /usr/local/bin/opsbox check --fail-on warn -f md -o /var/log/opsbox/report-$(date +\%Y\%m\%d).md >>/var/log/opsbox/cron.log 2>&1

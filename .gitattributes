@@ -1,0 +1,76 @@
+# ==============================================================================
+# 换行符策略（opsbox 必须显式声明，不能靠各人本地配置）
+#
+# 为什么必须写这个文件：
+#   opsbox 是纯 Bash 项目，脚本最终要在 Linux 上执行。如果这些文件在 Windows
+#   上以 CRLF 检出（Git for Windows 默认 core.autocrlf=true 就会这样），Linux
+#   侧会直接失败：
+#     - 执行脚本    → bad interpreter: /bin/bash^M: no such file or directory
+#     - 执行 Makefile → missing separator（\r 被当成命令的一部分）
+#     - 配置文件    → 变量值末尾多出一个 \r，阈值判断全部落空
+#   这类故障在 CI 上表现为「本地好好的，一提交就红」，排查代价极高。
+#   把 eol=lf 写进仓库，等于把约定固化到版本库里：无论谁、在哪台机器上克隆，
+#   检出的 shell 脚本都是 LF，与它的本地 git 配置无关。
+#
+# 约定：
+#   - 所有 *.sh、无扩展名的主入口 opsbox、Makefile 一律 LF；
+#   - 文档与配置模板也统一成 LF，避免 diff 里出现整文件「全改」的噪音；
+#   - 二进制文件显式标记，防止 text=auto 误判后破坏内容。
+# ==============================================================================
+
+# 默认：让 Git 自动判断文本/二进制，且所有文本文件一律以 LF 检出。
+#
+# 注意这里必须写成 `text=auto eol=lf`，不能只写 `text=auto`：
+# 后者在 Windows 上会按 core.autocrlf 把文本文件转成 CRLF 检出，
+# 那正是本文件要防的事情。只写 text=auto 等于「声明了问题却没解决问题」，
+# 而且是隐性的——本地看着正常，一到 Linux 或 CI 就炸。
+* text=auto eol=lf
+
+# ------------------------------------------------------------------ 必须 LF ----
+# Shell 脚本：CRLF 会直接导致 bad interpreter: /bin/bash^M
+*.sh            text eol=lf
+
+# 无扩展名的主入口，同样会被 /bin/bash 执行，必须显式列出
+opsbox          text eol=lf
+
+# 构建与自动化
+Makefile        text eol=lf
+.github/**      text eol=lf
+
+# systemd 单元与定时器：值末尾的 \r 会被 systemd 当成内容的一部分
+*.service       text eol=lf
+*.timer         text eol=lf
+
+# cron 任务文件：CRLF 会让 cron 解析失败（报 bad minute 之类），
+# 而且报错不会指向文件内容，极难排查
+examples/cron/** text eol=lf
+
+# YAML（CI 工作流、Prometheus 告警规则）
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Shell 脚本读取的配置模板：值末尾的 \r 会让阈值比较失效
+*.conf          text eol=lf
+
+# 文档
+*.md            text eol=lf
+*.txt           text eol=lf
+
+# 工程元文件
+.gitattributes  text eol=lf
+.gitignore      text eol=lf
+LICENSE         text eol=lf
+
+# ------------------------------------------------------------------ 二进制 ----
+# 显式声明为二进制，禁止 Git 做换行符转换与文本 diff
+*.png           binary
+*.jpg           binary
+*.jpeg          binary
+*.gif           binary
+*.ico           binary
+*.gz            binary
+*.xz            binary
+*.bz2           binary
+*.zip           binary
+*.tar           binary
+*.pdf           binary

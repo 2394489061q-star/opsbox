@@ -1,0 +1,116 @@
+# ==============================================================================
+# opsbox :: systemd/opsbox.service
+#
+# 安装位置：/etc/systemd/system/opsbox.service
+#
+# 职责：每次被触发时执行「一次」全量巡检，把 Markdown 报告落到
+#       /var/log/opsbox/latest.md，摘要（走 stderr 的 INFO 行）进入 journal。
+#       巡检是一次性批处理、没有常驻进程，所以 Type=oneshot；
+#       定时由 opsbox.timer 负责，本单元自己不管周期。
+#
+# 路径前提（与 packaging/install.sh 一致）：
+#   主程序：/usr/local/bin/opsbox —— 指向 /usr/local/lib/opsbox/opsbox 的符号链接
+#   配置：  /etc/opsbox/opsbox.conf
+#   报告：  /var/log/opsbox/
+#   如果你用 install.sh --prefix/--bin-dir/--report-dir 改过位置，install.sh 会在安装
+#   单元时用 sed 把下面这些路径重写成实际值，所以不要手工改一份又忘了另一份。
+#
+# 退出码契约（来自 opsbox 主程序，是单元成败判定的依据）：
+#   0=全部通过  1=存在 WARN  2=存在 CRIT  3=用法错误  4=采集失败
+#   本单元刻意不写 SuccessExitStatus：1/2/3/4 一律让单元进入 failed 状态，
+#   再由 OnFailure=opsbox-alert.service 接手通知。
+#   这是把「opsbox 的退出码契约」直接接到「systemd 的失败语义」上，
+#   因此告警判断不需要额外解析报告文本，也不会漏掉采集失败（退出码 4）这类情况。
+# ==============================================================================
+
+[Unit]
+Description=opsbox 服务器巡检（一次性执行，报告写入 /var/log/opsbox）
+# 巡检必须读 /etc/shadow（空密码账户）、journald 日志、systemctl 单元状态。
+# 降权运行会让 sec.empty_passwd 退化成 UNKNOWN、svc.* 与 log.* 大面积失真，
+# 因此这里不写 User=，即默认以 root 运行。
+OnFailure=opsbox-alert.service
+
+[Service]
+Type=oneshot
+
+# LogsDirectory 负责按需创建 /var/log/opsbox（并按 LogsDirectoryMode 设权限）。
+# 它必须先存在：systemd 在构建挂载命名空间时，对「不存在」的 ReadWritePaths
+# 会直接报 Failed to set up mount namespacing 并拒绝启动本单元。
+# 另外 systemd 也会把 LogsDirectory 指向的目录纳入本单元的可写路径，
+# 下面再显式写一次 ReadWritePaths，是为了不依赖不同 systemd 版本的隐含行为。
+LogsDirectory=opsbox
+LogsDirectoryMode=0750
+
+# -o 让 opsbox 把报告直接写进该文件（内部是 exec >file，会重定向 stdout），
+# 因此该目录必须已存在，否则 opsbox 以退出码 3 结束。
+# 显式写 --fail-on warn（这是主程序默认值）：WARN/CRIT 时返回 1/2，从而触发 OnFailure。
+ExecStart=/usr/local/bin/opsbox check --fail-on warn -f md -o /var/log/opsbox/latest.md
+
+# ---------------------------------------------------------------- 安全加固 ----
+# 每一项都写清了「为什么可以这样收紧」以及「它会挡住什么」，请按自己环境核对后再改。
+
+# 禁止通过 setuid/setgid 程序提权。opsbox 全程是普通读写与命令调用，
+# 不需要任何 setuid 程序，开启后无影响。
+NoNewPrivileges=yes
+
+# 普通文件系统树全部按只读挂载。
+# 【核对结论】ProtectSystem 只作用于普通文件系统，/dev、/proc、/sys 这三个 API
+# 文件系统树不受它影响，所以读 /proc/stat、/proc/meminfo、/proc/mounts、
+# /proc/net/tcp、/proc/1/cgroup、/sys/block/*、/etc/*（含 /etc/shadow）、
+# /var/log/* 全部照常工作，ProtectSystem=strict 并不会挡住 /proc。
+# /proc/sys 与 /sys/fs/cgroup 是被下面的 ProtectKernelTunables / ProtectControlGroups
+# 单独按只读挂载的 —— opsbox 对这些参数只读不写（ob_kernel_param 只做读取），
+# 所以同样不受影响。
+# 整套巡检唯一需要写入的位置是报告目录，见 ReadWritePaths。
+ProtectSystem=strict
+
+# /home、/root、/run/user 变成空目录。
+# 会挡住的：以 root 运行时 HOME=/root，于是主程序分层加载里的
+# ~/.config/opsbox/opsbox.conf 这一层读不到（顺序见 lib/core.sh ob_load_conf）。
+# 定时巡检依赖的是 /etc/opsbox/opsbox.conf，所以这里可以放心收紧；
+# 若你的环境确实用 root 的用户级配置做覆盖，请把它改成 ProtectHome=read-only。
+ProtectHome=true
+
+# 私有 /tmp 与 /var/tmp。
+# opsbox 从采集到渲染报告都不写临时文件（lib/ 与 modules/ 中没有 mktemp），
+# 所以私有 tmp 不会挡住任何检查；它的价值是让本单元产生的任何临时内容
+# 不与其他单元/用户互相可见，避免临时目录被干扰。
+PrivateTmp=yes
+
+# 唯一需要放行的写入路径。ProtectSystem=strict 下必须显式声明，否则报告写不进去
+# （opsbox 会因 exec >file 失败而以退出码 3 结束）。
+ReadWritePaths=/var/log/opsbox
+
+# /proc/sys 与 /sys 只读挂载。opsbox 只读 ip_forward、swappiness、
+# nf_conntrack_max 这类内核参数来算指标，从不修改它们，因此只读挂载无影响。
+ProtectKernelTunables=yes
+# 禁止加载/卸载内核模块（巡检不做这件事）。
+ProtectKernelModules=yes
+# 禁止改动 cgroup 层级。opsbox 不读写 cgroup 控制文件，
+# 容器判定走的是 /proc/1/cgroup 与 /run/.dockerenv，不受影响。
+ProtectControlGroups=yes
+
+# 以下几项对「纯 shell + coreutils」的巡检没有副作用，只是顺手关掉不需要的内核接口：
+# 禁止生成 SUID/SGID 文件、禁止实时调度、禁止修改 personality、禁止改时钟/读 RTC。
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+ProtectClock=yes
+
+# -------------------------------------------------------- 故意不开启的加固项 ----
+# ProtectProc= / ProcSubset=：会把 /proc/<pid> 隐藏或裁剪，而 opsbox 的进程统计、
+#   僵尸进程、Top CPU/内存进程、容器与虚拟化回退判定都要直读 /proc/<pid>/stat、
+#   /proc/<pid>/status、/proc/1/environ。开了会让 system/service 模块大面积失真。
+# ProtectKernelLogs=yes：会挡住 /dev/kmsg 与 syslog(2) 系统调用。opsbox 的 OOM 检查
+#   走 journalctl 与日志文件，一般不受影响；但这条会削弱人工用 dmesg 交叉验证的能力。
+# CapabilityBoundingSet=：读权限为 000 的 /etc/shadow 需要 CAP_DAC_OVERRIDE，
+#   读 /proc/1/environ 做容器/虚拟化回退判定需要 CAP_SYS_PTRACE。
+#   一旦裁掉能力集，这些检查会静默降级为 UNKNOWN，所以这里不做能力裁剪。
+# PrivateDevices=yes：会移除 /dev 下的块设备节点。当前模块只解析 /proc/diskstats 与
+#   /sys/block，不打开 /dev/sdX，理论上可以开；但若你扩展了需要设备节点的检查，
+#   请先确认再开启。
+
+[Install]
+# 本单元是 oneshot 且由 timer 触发，刻意不提供安装配置：
+# 所以不要执行 `systemctl enable opsbox.service`（systemd 会报该单元没有 [Install] 段），
+# 需要启用的是 opsbox.timer。

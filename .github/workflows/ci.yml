@@ -1,0 +1,188 @@
+# ==============================================================================
+# opsbox :: GitHub Actions 持续集成
+#
+# 三个 job：
+#   1. 语法与静态检查 —— shellcheck（排除清单逐条有理由）+ 全量 bash -n
+#   2. 测试套件       —— 端到端测试（夹具模式）+ 真实 /proc 上的冒烟测试
+#   3. shell 兼容性   —— 用 grep 断言源码中没有 Bash 4 专有语法（守住 Bash 3.2+）
+#
+# 关于路径：CI 只依赖仓库里真实存在的入口与目录
+#           （opsbox、lib/、modules/、tests/、tests/fixtures/、conf/、scripts/）。
+#           待检查的脚本清单用 find 递归收集，所以今后新增 examples/、packaging/、
+#           tests/ 下的任何 *.sh 都会自动纳入，不需要回来改这个文件。
+# ==============================================================================
+
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# 同一分支上的连续推送只保留最新一次运行，避免排队浪费 runner 时间
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# CI 只读代码，不需要写权限
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================================
+  # job 1：语法与静态检查
+  # ============================================================================
+  lint:
+    name: 语法与静态检查
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+
+      # 排除清单集中在 scripts/shellcheck.sh 里，每条都写了中文理由。
+      #
+      # 这里刻意分两层跑：
+      #   本项目的 OB_CFG_* 阈值变量是在运行时 source 配置文件后才存在的，
+      #   静态分析看不到它们，必然产生一批「无法靠改代码消除」的噪音
+      #   （改了就不再是配置与代码分离了）。
+      #   让 CI 因为这些噪音常年变红，结果只会是所有人都学会无视它。
+      #   所以：error 级别作为阻断条件；warning 级别只出完整报告，不挡流水线。
+      - name: shellcheck（阻断：只挡真正的错误）
+        run: bash scripts/shellcheck.sh --severity=error
+
+      - name: shellcheck 完整报告（severity=warning，仅供参考不阻断）
+        continue-on-error: true
+        run: bash scripts/shellcheck.sh --severity=warning
+
+      # 递归收集仓库内所有 *.sh（今后新增 examples/、packaging/ 也自动纳入），
+      # 跳过 .git 与测试中间产物 tests/.work。
+      - name: bash -n 全量语法检查
+        run: |
+          set -uo pipefail
+          files="$(printf '%s\n' opsbox; find . -path './.git' -prune -o -path './tests/.work' -prune -o -type f -name '*.sh' -print | LC_ALL=C sort)"
+          n=0
+          for f in $files; do
+            bash -n "$f" || { printf '::error::bash -n 失败：%s\n' "$f"; exit 1; }
+            n=$((n + 1))
+          done
+          printf 'bash -n 通过：%s 个脚本\n' "$n"
+
+  # ============================================================================
+  # job 2：测试套件
+  # ============================================================================
+  tests:
+    name: 测试套件
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # tests/run-tests.sh 会用 Python 解析 JSON 来校验报告结构，
+      # 它优先找 python3、退回 python。ubuntu-latest 自带 python3，
+      # 这里显式装一次是为了固定版本、避免镜像变更带来的意外。
+      - name: 准备 Python（测试套件的 JSON 结构校验用）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: 端到端测试套件（夹具模式，不需要 root）
+        run: bash tests/run-tests.sh
+
+      # 夹具测试证明的是「逻辑对不对」；这一条证明「在真实 /proc 上跑得起来」。
+      - name: 真实 /proc 冒烟测试（json / md / prom）
+        run: |
+          set -uo pipefail
+          rc=0
+          for fmt in json md prom; do
+            bash opsbox check -f "$fmt" >"smoke-$fmt.out" 2>"smoke-$fmt.err"
+            code=$?
+            # 真实机器上出现 WARN/CRIT 是正常的：0=通过 1=WARN 2=CRIT 都接受；
+            # 3=用法错误、4=采集失败 才说明工具本身有问题。
+            if [ "$code" -le 2 ]; then
+              printf 'check -f %-4s 退出码 %s（允许 0/1/2）\n' "$fmt" "$code"
+            else
+              printf '::error::opsbox check -f %s 退出码 %s，只允许 0/1/2\n' "$fmt" "$code"
+              cat "smoke-$fmt.err"
+              rc=1
+            fi
+          done
+          exit "$rc"
+
+      - name: 断言三种格式都产出了内容
+        run: |
+          set -euo pipefail
+          for fmt in json md prom; do
+            [ -s "smoke-$fmt.out" ] || { printf '::error::smoke-%s.out 为空\n' "$fmt"; exit 1; }
+          done
+          grep -q 'opsbox_overall_status' smoke-prom.out
+          grep -q 'Linux 服务器巡检报告' smoke-md.out
+          printf 'json / md / prom 均有非空输出\n'
+
+      - name: 校验 JSON 输出是合法 JSON
+        run: |
+          python3 - <<'PY'
+          import json
+          d = json.load(open('smoke-json.out', encoding='utf-8'))
+          assert d['tool']['name'] == 'opsbox', d.get('tool')
+          assert d['schema'].startswith('opsbox.report/'), d.get('schema')
+          assert 'summary' in d and 'results' in d, sorted(d)
+          n = len(d['results'])
+          assert n > 0, 'results 为空'
+          print('JSON 合法：%d 条结果，CRIT=%s WARN=%s OK=%s'
+                % (n, d['summary'].get('crit'), d['summary'].get('warn'), d['summary'].get('ok')))
+          PY
+
+  # ============================================================================
+  # job 3：shell 兼容性
+  # ============================================================================
+  compat:
+    name: shell 兼容性
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      # 为什么不用 `bash --posix` 来验证兼容性：
+      #   本项目是纯 Bash 脚本，正常使用了 local、索引数组、here-string、
+      #   ${var//pat/rep} 等 Bash 扩展。--posix 会让这些完全合法的语法直接报错，
+      #   测出来的是「有没有用 bash 扩展」，而不是我们真正要守住的东西。
+      #
+      # 项目兼容 Bash 3.2+（macOS 自带的 bash）的方式是「不使用 Bash 4 专有语法」。
+      # 具体是三条硬约束，本 job 把它变成可执行的 grep 断言：
+      #   1. 不使用关联数组：declare -A / typeset -A / local -A
+      #   2. 不使用大小写转换：${var,,} / ${var^^}
+      #   3. 不使用 mapfile / readarray
+      # 注意：`local -a`（索引数组）从 Bash 2 就有，必须放行，所以模式大小写敏感。
+      - name: 断言未使用 Bash 4 专有语法（Bash 3.2+ 兼容）
+        run: |
+          set -uo pipefail
+          files="$(printf '%s\n' opsbox; find . -path './.git' -prune -o -path './tests/.work' -prune -o -type f -name '*.sh' -print | LC_ALL=C sort)"
+
+          fail=0
+          scan() {
+            local name="$1" re="$2" hits
+            # 逐行匹配，但丢掉「以 # 开头的整行注释」：注释里讨论这些语法
+            # （例如 lib/core.sh 顶部写着“不使用 ${var,,}”）属于文档说明，不是使用。
+            # 代码里真的写了这些写法，仍然会被抓出来。
+            hits="$(grep -nE "$re" $files | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#' || true)"
+            if [ -n "$hits" ]; then
+              printf '::error::发现 Bash 4 专有语法 —— %s\n%s\n' "$name" "$hits"
+              fail=1
+            else
+              printf 'OK  未出现：%s\n' "$name"
+            fi
+          }
+
+          scan '关联数组（declare -A / typeset -A / local -A）' '(declare|typeset|local)[[:space:]]+-A'
+          scan '大小写转换（${var,,} / ${var^^}）' '\$\{[A-Za-z_][A-Za-z0-9_]*(,,|\^\^)'
+          scan 'mapfile / readarray' '(^|[^A-Za-z_])(mapfile|readarray)([^A-Za-z_]|$)'
+
+          if [ "$fail" -ne 0 ]; then
+            printf '请改用：索引数组 + 显式遍历、tr 做大小写转换、while IFS= read -r 逐行读取。\n'
+          fi
+          exit "$fail"

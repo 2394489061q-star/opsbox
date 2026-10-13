@@ -1,0 +1,122 @@
+# ==============================================================================
+# opsbox :: examples/prometheus/opsbox.rules.yml
+#
+# Prometheus 告警规则示例。指标全部来自 opsbox 的 `-f prom` 输出，
+# 也就是 lib/report.sh 里 ob_render_prom() 实际打印的那些（逐个核对过，没有臆造）：
+#
+#   opsbox_check_status{module="<模块>",check="<检查项 id>"}   0=OK 1=WARN 2=CRIT 3=UNKNOWN
+#   opsbox_check_total{status="ok|warn|crit|unknown"}          各状态的检查项数量
+#   opsbox_overall_status                                      0=OK 1=WARN 2=CRIT 3=UNKNOWN
+#   opsbox_last_run_timestamp_seconds                          本次巡检完成时间的 Unix 时间戳
+#   opsbox_run_duration_seconds                                本次巡检耗时（秒）
+#   opsbox_info{hostname,os,kernel,version}                    值恒为 1
+#
+# 使用方式：
+#   rule_files:
+#     - /etc/prometheus/rules/opsbox.rules.yml
+#   然后 `promtool check rules opsbox.rules.yml` 校验。
+#
+# 注意：这些指标由 node_exporter 的 textfile collector 提供，
+#       因此 instance/job 这类 target label 来自 node_exporter 的抓取配置，
+#       规则里的 {{ $labels.instance }} 指的是被巡检的那台机器的 node_exporter。
+# ==============================================================================
+
+groups:
+  - name: opsbox
+    rules:
+      # ------------------------------------------------------------ 整体结论 ----
+      # 为什么看 opsbox_overall_status 而不是 opsbox_check_status：
+      # 整体状态是「最严重的那一项」，正是 opsbox 自己用来决定退出码（1/2）的依据，
+      # 拿它做告警可以和命令行手工巡检的结论完全一致。
+      - alert: OpsboxOverallCrit
+        expr: 'opsbox_overall_status >= 2'
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "opsbox 巡检结论为 CRIT（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 最近一次巡检判定存在严重问题（opsbox_overall_status=2）。请查看该机 /var/log/opsbox/latest.md 的「需要处理的问题」章节，或执行 `opsbox check` 复现。"
+        # for: 10m 的作用是躲开瞬时抖动：例如一次突发 IO 让磁盘延迟短暂越过 CRIT，
+        # 10 分钟后仍是 CRIT 才说明它是持续的，值得叫人起床。
+
+      - alert: OpsboxOverallWarn
+        expr: 'opsbox_overall_status == 1'
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "opsbox 巡检结论为 WARN（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 最近一次巡检存在需要关注的项目（opsbox_overall_status=1），但尚未达到严重级别。建议在下一个工作日按 /var/log/opsbox/latest.md 的处置建议处理。"
+        # 用 == 1 而不是 >= 1：CRIT 已经由上面那条规则接管，
+        # 否则一个 CRIT 会同时触发 critical 和 warning 两条告警，制造重复通知。
+
+      # ------------------------------------------------------------ 单项检查 ----
+      # 整体状态告诉你「这台机器有问题」，单检查项告诉你是「哪一项」。
+      # module 与 check 两个 label 直接取自指标，正好也是 opsbox 静音检查项时用的键
+      # （OB_CFG_DISABLE_CHECKS 里写 "<module>.<check>"）。
+      - alert: OpsboxCheckCrit
+        expr: 'opsbox_check_status == 2'
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "巡检项 {{ $labels.module }}/{{ $labels.check }} 为 CRIT（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 的检查项 {{ $labels.module }}/{{ $labels.check }} 持续 15 分钟处于 CRIT。若确认该检查项在当前环境不适用（例如容器内没有 systemd），可在该机 /etc/opsbox/opsbox.conf 里用 OB_CFG_DISABLE_CHECKS 精确静音，而不是整体关掉模块。"
+
+      - alert: OpsboxCheckWarn
+        expr: 'opsbox_check_status == 1'
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "巡检项 {{ $labels.module }}/{{ $labels.check }} 为 WARN（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 的检查项 {{ $labels.module }}/{{ $labels.check }} 已持续 1 小时处于 WARN。1 小时的 for 是为了过滤掉业务高峰期的正常波动（如 CPU 使用率短暂超过警告线）。"
+
+      # -------------------------------------------------------- 巡检自身健康 ----
+      # 巡检工具本身停摆比任何单台机器的故障都更危险：它会安静地不告警。
+      # 因此下面三条专门盯「opsbox 有没有在跑、跑得对不对」。
+      - alert: OpsboxReportStale
+        expr: 'time() - opsbox_last_run_timestamp_seconds > 172800'
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "opsbox 巡检已超过 48 小时未更新（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 的 opsbox_last_run_timestamp_seconds 距今超过 48 小时。请检查该机的 opsbox.timer（systemctl list-timers opsbox.timer）或 /etc/cron.d/opsbox-daily 是否还在运行、textfile 采集脚本是否报错、node_exporter 是否还能读到 textfile 目录。"
+        # 172800 秒 = 48 小时：比「每天一次」的调度宽限了一整天，
+        # 避免周末/维护窗口的正常跳过一次就误报。
+
+      - alert: OpsboxRunSlow
+        expr: 'opsbox_run_duration_seconds > 120'
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "opsbox 单次巡检耗时超过 120 秒（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 的巡检耗时 opsbox_run_duration_seconds 持续超过 120 秒。除了机器本身负载高，常见原因是 OB_CFG_SEC_SUID_ENABLE 打开了全盘 SUID 扫描、OB_CFG_LOG_SCAN_BYTES 过大，或磁盘 IO 已经严重劣化。"
+        # 巡检变慢往往是磁盘劣化或负载升高的早期信号，值得在它影响业务前知道。
+
+      - alert: OpsboxUnknownChecks
+        expr: 'sum(opsbox_check_total{status="unknown"}) > 0'
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "opsbox 有检查项无法判定（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 存在状态为 UNKNOWN 的检查项（opsbox_check_total{status=\"unknown\"} > 0），说明数据不足而不是「没问题」。最常见原因是权限不足（读不到 /etc/shadow、journalctl 无权限）或缺少命令（df/journalctl/systemctl）。请对照报告里该项的「观测值」定位。"
+        # UNKNOWN 是最容易被忽略的状态：它既不是 OK 也不是故障，
+        # 但如果没人管，监控会一直以为自己覆盖了这些检查项。
+
+      # ------------------------------------------------------------ 指标缺失 ----
+      - alert: OpsboxMetricsMissing
+        expr: 'absent(opsbox_overall_status)'
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "采集不到 opsbox 指标（{{ $labels.instance }}）"
+          description: "实例 {{ $labels.instance }} 上已经找不到 opsbox_overall_status 指标。请确认 node_exporter 的 textfile collector 参数（--collector.textfile.directory）与实际写文件的目录一致，并且示例脚本 examples/prometheus/node_exporter-textfile.sh 正在被定时执行。"
+        # absent() 在「整组序列消失」时返回一条无 label 的样本，
+        # 所以这条规则的告警不会带具体的 instance label——这是 absent 的固有行为，不是写错了。
+        # 如果所有机器都还没部署 textfile 采集，这条会一直处于 firing，因此默认建议先注释掉它，
+        # 等部署铺开后再打开。

@@ -1,0 +1,52 @@
+# ==============================================================================
+# opsbox :: systemd/opsbox.timer
+#
+# 安装位置：/etc/systemd/system/opsbox.timer
+#
+# 职责：按日历定时拉起 opsbox.service（oneshot）。
+#       启用方式是 `systemctl enable --now opsbox.timer`——启用 timer，而不是 service。
+#
+# 路径前提：ExecStart 里的路径在 opsbox.service 中；本文件不含任何路径，
+#           因此它不需要 packaging/install.sh 做路径重写。
+# ==============================================================================
+
+[Unit]
+Description=定时触发 opsbox 巡检（每天一次，带随机延迟）
+# 本 timer 只负责触发，失败通知由 opsbox-alert.service 通过 opsbox.service 的
+# OnFailure= 完成，所以这里不重复声明依赖关系。
+
+[Timer]
+# 每天 06:30 触发一次。
+# 选择清晨而不是整点：整点是备份、日志轮转、证书续期的拥堵时段，错开可以减少
+# 与它们抢 IO 造成的误报（例如磁盘 IO 延迟检查）。
+# 报告里的日志窗口是「1 hour ago」（OB_CFG_LOG_SINCE），落在 06:30 正好覆盖夜间批处理。
+OnCalendar=*-*-* 06:30:00
+
+# 随机推迟 0~30 分钟再触发。
+# 这是给集群用的：成百上千台机器如果同一秒一起跑巡检，会在 journal、远端日志、
+# 上报端点上打出一个尖峰（惊群）。随机化把负载摊开，
+# 也顺带让「巡检发生在哪一分哪一秒」不再是一个可被预测的固定值。
+RandomizedDelaySec=30min
+
+# 显式写出触发精度：systemd 默认会把同一时间窗内的唤醒合并到 1 分钟精度。
+# 为了让定时器不为了「准点」而频繁唤醒 CPU，保持这个粒度，
+# 巡检早一分钟晚一分钟没有区别。
+AccuracySec=1min
+
+# 触发时如果机器正在关机/休眠，错过的那次在下次开机后补跑一次。
+# 对巡检来说「补跑」比「静默跳过」有价值得多——跳过一次就等于监控盲区。
+Persistent=true
+
+# 额外在开机 15 分钟后再跑一次。
+# 与 OnCalendar 是「并集」关系：重启后能尽早发现异常（失败单元、未挂载磁盘、
+# 刚重启导致的 uptime 过短等）。15 分钟是留给业务稳定下来的窗口。
+OnBootSec=15min
+
+# 明确写出被激活的单元，方便和 opsbox.service / opsbox-alert.service 对照阅读。
+# （默认值本来就是同名 .service，写出来只是为了可读性。）
+Unit=opsbox.service
+
+[Install]
+# timer 要挂到 timers.target 上（不是 multi-user.target），
+# 这样启用后由 systemd 的定时器子系统统一管理。
+WantedBy=timers.target

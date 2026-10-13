@@ -1,0 +1,94 @@
+# ==============================================================================
+# opsbox :: systemd/opsbox-alert.service
+#
+# 安装位置：/etc/systemd/system/opsbox-alert.service
+#
+# 职责：当 opsbox.service 以非零退出码结束时（1=WARN、2=CRIT、3=用法错误、
+#       4=采集失败），由 opsbox.service 的 OnFailure= 拉起本单元，
+#       把巡检结论通过外部通道（webhook / 自定义通知脚本）发出去。
+#
+# 为什么触发条件不写在单元里：OnFailure= 只能声明「指向哪个单元」，
+#   无法表达「只在退出码 1/2 时触发」。因此这里先取结论，再决定通知内容：
+#     1) 优先读 /var/log/opsbox/latest.md 的结论行（不重复做一次完整巡检）；
+#     2) 报告不存在或读不到结论时，才用 `opsbox check -f oneline --fail-on never`
+#        兜底取一行摘要（--fail-on never 保证它自身返回 0，不会把本单元拖失败）；
+#     3) systemd 246+ 在 OnFailure 触发的单元里会注入 MONITOR_EXIT_STATUS 等变量，
+#        存在就附在通知末尾作为线索；旧版本没有这个变量也照样能工作。
+#
+# 通知方式全部来自环境变量，单元里不含任何密钥：
+#   把下面两行之一写进 /etc/opsbox/alert.env（不存在时 EnvironmentFile 的 `-` 前缀会忽略）：
+#     OPSBOX_ALERT_CMD=/usr/local/lib/opsbox/examples/alert/webhook.sh
+#     OPSBOX_WEBHOOK_URL=https://example.invalid/hooks/xxxx
+#   注意 OPSBOX_ALERT_CMD 必须是「一个可执行文件路径」，不能带参数
+#   （本单元不经过 shell 解析它，参数请写进你自己的脚本里）。
+# ==============================================================================
+
+[Unit]
+Description=opsbox 巡检告警通知（由 opsbox.service 失败时触发）
+# 这里不写 After=/Conflicts=/Requires=：OnFailure= 触发的实例与 opsbox.service
+# 不会并发（systemd 默认同一单元只会有一个活动实例），而通知要做的第一件事
+# 就是读 opsbox.service 刚写好的报告文件，所以它天然发生在巡检之后。
+# 通知本身很快（curl 有 10 秒超时），不需要额外的超时守护。
+
+[Service]
+Type=oneshot
+
+EnvironmentFile=-/etc/opsbox/alert.env
+
+# 下面整段是交给 /bin/sh 的脚本，用单引号包住，因此内部不能出现单引号。
+# 单元文件里 `$$` 表示一个字面 `$`（systemd 会先做一次变量替换，不转义的话
+# $report 之类会被 systemd 当成自己的变量展开成空串），行尾的 `\` 是续行，
+# systemd 会把它连同换行替换成一个空格，所以脚本里的空格多少不影响语义。
+# 同理，`%` 在 systemd 单元里是说明符(specifier)前缀——`%s` 会被 systemd 换成
+# shell 路径，所以 printf 的格式串必须写成 `%%s`，由 systemd 还原成一个 `%`。
+# （`\n` 属于 C 风格转义，会被 systemd 换成真正的换行字符；这恰好也是 printf 想要的，
+#   效果与 shell 自己解释 \n 完全一致，所以这里不必再写成别的形式。）
+# 还有一处刻意的写法：下面匹配结论行的正则用 `[*][*]` 而不是 `\*\*`。
+# systemd 对引号内的反斜杠会做 C 风格转义处理，`\*` 这种「未知转义」在不同版本上
+# 的去留不一致；字符类完全不涉及反斜杠，语义确定，交给 shell 的就是原样字符串。
+# 顺带说明被匹配的内容来自 lib/report.sh 的 ob_render_markdown，
+# 结论行形如 `**WARN** —— 存在需要关注的项目，建议近期处理`，
+# 而 `**XXX**` 这种写法在该报告里只有结论行会出现，因此这一条匹配不会误判。
+ExecStart=/bin/sh -c '\
+    set -u; \
+    report=/var/log/opsbox/latest.md; \
+    excerpt=""; \
+    if [ -r "$$report" ]; then \
+        excerpt="$$(grep -m1 -E "^[*][*](WARN|CRIT)[*][*]" "$$report" 2>/dev/null || true)"; \
+    fi; \
+    if [ -z "$$excerpt" ]; then \
+        excerpt="$$(/usr/local/bin/opsbox check -f oneline --fail-on never 2>/dev/null || true)"; \
+    fi; \
+    if [ -z "$$excerpt" ]; then \
+        excerpt="opsbox 未能给出结论（可能退出码 3/4），请执行 journalctl -u opsbox.service 查看"; \
+    fi; \
+    if [ -n "$${MONITOR_EXIT_STATUS:-}" ]; then \
+        excerpt="$$excerpt [触发单元退出码 $${MONITOR_EXIT_STATUS}]"; \
+    fi; \
+    printf "%%s\n" "$$excerpt"; \
+    if [ -n "$${OPSBOX_ALERT_CMD:-}" ]; then \
+        printf "%%s\n" "$$excerpt" | "$$OPSBOX_ALERT_CMD"; \
+    elif [ -n "$${OPSBOX_WEBHOOK_URL:-}" ] && command -v curl >/dev/null 2>&1; then \
+        printf "%%s\n" "$$excerpt" | curl -fsS -m 10 -X POST -H "Content-Type: text/plain; charset=utf-8" --data-binary @- "$$OPSBOX_WEBHOOK_URL" >/dev/null; \
+    else \
+        printf "未配置通知方式（/etc/opsbox/alert.env 中的 OPSBOX_ALERT_CMD 或 OPSBOX_WEBHOOK_URL），本次只写入 journal。\n" >&2; \
+    fi'
+
+# ---------------------------------------------------------------- 安全加固 ----
+# 与 opsbox.service 同样的收紧思路，但有两处必须不同：
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+# 刻意不做的两件事：
+# 1) 不设 ReadWritePaths：本单元只读报告、只写网络与 journal，不需要任何可写文件路径。
+# 2) 不设 PrivateNetwork= / IPAddressDeny=：通知要出网，而 webhook 主机名无法在单元里
+#    预先枚举。若你的环境只允许访问固定告警网关，请自行加 IPAddressAllow= 收窄，
+#    但那会同时挡住任何自定义的 OPSBOX_ALERT_CMD。
